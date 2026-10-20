@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mosaico de vídeos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📺%3C/text%3E%3C/svg%3E">
+<style>
+  :root { --bg:#14120f; --bar:#1f1c17; --line:#3a352c; --text:#ece6da; --dim:#a79f8f; --accent:#e8b04a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; width:100%; height:100%; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; overflow:hidden; }
+  body { display:flex; flex-direction:column; }
+  header { padding:8px 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; background:var(--bar); border-bottom:1px solid var(--line); }
+  header strong { font-weight:600; }
+  input { min-width:200px; flex:1; padding:8px 10px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; }
+  button { padding:8px 12px; cursor:pointer; background:#2a261f; color:var(--text); border:1px solid var(--line); border-radius:6px; }
+  button:hover { border-color:var(--accent); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .hint { font-size:12px; color:var(--dim); width:100%; }
+  #grid { flex:1; min-height:0; display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; gap:3px; }
+  #grid.focus { grid-template-columns:3fr 1fr; grid-template-rows:repeat(3,1fr); }
+  #grid.focus .slot.big { grid-column:1; grid-row:1 / 4; }
+  .slot { position:relative; min-width:0; min-height:0; background:#000; }
+  .slot iframe { width:100%; height:100%; border:0; display:block; }
+  .slot.sel { outline:2px solid var(--accent); outline-offset:-2px; }
+  .empty { position:absolute; inset:0; display:grid; place-items:center; color:var(--dim); font-size:14px; cursor:pointer; text-align:center; padding:12px; }
+  .tools { position:absolute; top:6px; left:6px; display:flex; gap:4px; opacity:0; transition:opacity .15s; z-index:2; }
+  .slot:hover .tools, .tools:focus-within { opacity:1; }
+  .tools button { padding:4px 8px; font-size:14px; background:rgba(20,18,15,.85); }
+  .tools button.on { border-color:var(--accent); color:var(--accent); }
+  #showbar { position:fixed; right:10px; top:10px; z-index:10; opacity:.5; display:none; }
+  #showbar:hover, #showbar:focus { opacity:1; }
+  body.hide-header header { display:none; }
+  body.hide-header #showbar { display:block; }
+  @media (max-width:650px) {
+    #grid, #grid.focus { grid-template-columns:1fr; grid-template-rows:repeat(4,50vh); overflow:auto; }
+    #grid.focus .slot.big { grid-column:auto; grid-row:auto; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <strong>Mosaico</strong>
+  <input id="video" placeholder="Pega una o varias URLs de YouTube (separadas por espacio o salto de línea)" aria-label="URLs de YouTube">
+  <button id="add">Cargar</button>
+  <button id="copy">Copiar enlace del mosaico</button>
+  <button id="clear">Limpiar todo</button>
+  <button id="hide">Ocultar barra</button>
+  <span class="hint">Cada cuadro tiene botones al pasar el ratón: 🔊 sonido, ⤢ ampliar, ✎ reemplazar, ✕ quitar. Tecla H: mostrar u ocultar esta barra. Aceptamos vídeos, directos, shorts, listas y tiempo de inicio.</span>
+</header>
+<button id="showbar" title="Mostrar controles (H)">☰</button>
+<main id="grid"></main>
+<script>
+(() => {
+  const N = 4;
+  const grid = document.getElementById('grid');
+  const input = document.getElementById('video');
+  let state = Array(N).fill(null);
+  let sound = -1, big = -1, selected = -1;
+  const slots = [];
+
+  // ---------- Lectura de URLs ----------
+  const secs = t => {
+    if (!t) return 0;
+    if (/^\d+$/.test(t)) return +t;
+    const m = t.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+    return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0;
+  };
+  function parse(raw) {
+    try {
+      const u = new URL(raw.trim());
+      const h = u.hostname.replace(/^(www|m)\./, '');
+      if (h !== 'youtu.be' && !h.endsWith('youtube.com') && !h.endsWith('youtube-nocookie.com')) return null;
+      const p = u.pathname.split('/').filter(Boolean);
+      let id = '';
+      if (h === 'youtu.be') id = p[0] || '';
+      else if (['embed', 'shorts', 'live', 'v'].includes(p[0])) id = p[1] || '';
+      else id = u.searchParams.get('v') || '';
+      if (id === 'videoseries') id = '';
+      const list = u.searchParams.get('list') || '';
+      const start = secs(u.searchParams.get('t') || u.searchParams.get('start') || '');
+      if (!/^[\w-]{11}$/.test(id)) id = '';
+      return (id || list) ? { id, list, start } : null;
+    } catch { return null; }
+  }
+
+  // ---------- Guardado en URL y localStorage ----------
+  const enc = v => v ? (v.id || '') + (v.start ? '@' + v.start : '') + (v.list ? '~' + v.list : '') : '';
+  const dec = s => {
+    if (!s) return null;
+    const m = s.match(/^([\w-]*)(?:@(\d+))?(?:~([\w-]+))?$/);
+    return m && (m[1] || m[3]) ? { id: m[1] || '', start: +m[2] || 0, list: m[3] || '' } : null;
+  };
+  function save() {
+    const s = state.map(enc).join(',');
+    try { history.replaceState(null, '', s.replace(/,/g, '') ? '#v=' + s : location.pathname + location.search); } catch {}
+    try { localStorage.setItem('mosaico', s); } catch {}
+  }
+  function load() {
+    let s = '';
+    const m = location.hash.match(/^#v=(.*)$/);
+    if (m) s = m[1];
+    else { try { s = localStorage.getItem('mosaico') || ''; } catch {} }
+    s.split(',').slice(0, N).forEach((x, i) => { state[i] = dec(x); });
+  }
+
+  // ---------- Reproductores ----------
+  function src(v) {
+    const q = new URLSearchParams({ autoplay: 1, mute: 1, rel: 0, playsinline: 1, enablejsapi: 1 });
+    if (location.protocol.startsWith('http')) q.set('origin', location.origin);
+    if (v.start) q.set('start', v.start);
+    if (v.list) q.set('list', v.list);
+    return 'https://www.youtube.com/embed/' + (v.id ? encodeURIComponent(v.id) : 'videoseries') + '?' + q;
+  }
+  const cmd = (f, func) => {
+    const w = f && f.contentWindow;
+    if (w) w.postMessage(JSON.stringify({ event: 'command', func, args: [] }), '*');
+  };
+  function applySound() {
+    slots.forEach((s, i) => {
+      const f = s.el.querySelector('iframe');
+      cmd(f, i === sound ? 'unMute' : 'mute');
+      s.snd.classList.toggle('on', i === sound);
+    });
+  }
+
+  // ---------- Dibujo ----------
+  function build() {
+    for (let i = 0; i < N; i++) {
+      const el = document.createElement('div');
+      el.className = 'slot';
+      el.innerHTML =
+        '<div class="tools">' +
+        '<button data-a="snd" title="Activar sonido en este cuadro">🔊</button>' +
+        '<button data-a="big" title="Ampliar o reducir">⤢</button>' +
+        '<button data-a="edit" title="Reemplazar este vídeo">✎</button>' +
+        '<button data-a="del" title="Quitar">✕</button></div>' +
+        '<div class="body"></div>';
+      el.addEventListener('click', e => {
+        const b = e.target.closest('button');
+        if (b) return act(i, b.dataset.a);
+        if (e.target.classList.contains('empty')) act(i, 'edit');
+      });
+      grid.appendChild(el);
+      slots.push({ el, body: el.querySelector('.body'), snd: el.querySelector('[data-a=snd]'), key: null });
+    }
+  }
+  function render() {
+    slots.forEach((s, i) => {
+      const v = state[i], key = v ? JSON.stringify(v) : '';
+      if (s.key !== key) {
+        s.key = key;
+        s.body.innerHTML = '';
+        if (v) {
+          const f = document.createElement('iframe');
+          f.src = src(v);
+          f.title = 'Vídeo de YouTube ' + (i + 1);
+          f.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+          f.allowFullscreen = true;
+          f.referrerPolicy = 'strict-origin-when-cross-origin';
+          f.addEventListener('load', () => setTimeout(applySound, 1200));
+          s.body.style.height = '100%';
+          s.body.appendChild(f);
+        } else {
+          s.body.style.height = '100%';
+          s.body.innerHTML = '<div class="empty">Cuadro ' + (i + 1) + ' vacío. Haz clic para elegirlo y pega una URL.</div>';
+        }
+      }
+      s.el.classList.toggle('sel', i === selected);
+      s.el.classList.toggle('big', i === big);
+    });
+    grid.classList.toggle('focus', big >= 0);
+    applySound();
+    save();
+  }
+
+  // ---------- Acciones ----------
+  function act(i, a) {
+    if (a === 'snd') { sound = sound === i ? -1 : i; }
+    if (a === 'big') { big = big === i ? -1 : i; }
+    if (a === 'del') {
+      state[i] = null;
+      if (sound === i) sound = -1;
+      if (big === i) big = -1;
+    }
+    if (a === 'edit') {
+      selected = i;
+      document.body.classList.remove('hide-header');
+      input.focus();
+    }
+    render();
+  }
+  function place(v) {
+    let i = selected;
+    selected = -1;
+    if (i < 0) i = state.findIndex(x => !x);
+    if (i < 0) i = (slots.rot = ((slots.rot ?? -1) + 1) % N);
+    state[i] = v;
+  }
+  document.getElementById('add').addEventListener('click', () => {
+    const urls = input.value.split(/[\s,]+/).filter(Boolean);
+    const vids = urls.map(parse).filter(Boolean);
+    if (!vids.length) { alert('No encontré ninguna URL válida de YouTube. Prueba con el enlace completo del vídeo.'); return; }
+    vids.slice(0, N).forEach(place);
+    input.value = '';
+    if (state.every(Boolean)) document.body.classList.add('hide-header');
+    render();
+    input.focus();
+  });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('add').click(); });
+  document.getElementById('clear').addEventListener('click', () => {
+    state = Array(N).fill(null);
+    sound = big = selected = -1;
+    document.body.classList.remove('hide-header');
+    render();
+  });
+  document.getElementById('copy').addEventListener('click', async e => {
+    try { await navigator.clipboard.writeText(location.href); e.target.textContent = 'Enlace copiado'; }
+    catch { prompt('Copia este enlace:', location.href); }
+    setTimeout(() => { e.target.textContent = 'Copiar enlace del mosaico'; }, 1800);
+  });
+  const setBar = hide => document.body.classList.toggle('hide-header', hide);
+  document.getElementById('hide').addEventListener('click', () => setBar(true));
+  document.getElementById('showbar').addEventListener('click', () => setBar(false));
+  document.addEventListener('keydown', e => {
+    if (e.target === input || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key.toLowerCase() === 'h') setBar(!document.body.classList.contains('hide-header'));
+  });
+
+  build();
+  load();
+  if (state.every(Boolean)) document.body.classList.add('hide-header');
+  render();
+})();
+</script>
+</body>
+</html>
